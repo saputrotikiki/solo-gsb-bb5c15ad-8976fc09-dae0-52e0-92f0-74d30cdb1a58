@@ -50,6 +50,15 @@ class ConfirmBody(BaseModel):
     trans_rev: int
 
 
+class WithdrawBody(BaseModel):
+    status_version: int  # 读取时的状态版本（乐观锁）
+    reason: str = Field(min_length=1)  # 撤展原因（必填）
+
+
+class RestoreBody(BaseModel):
+    status_version: int  # 读取时的状态版本（乐观锁）
+
+
 # ---------------------------- 应用生命周期 ----------------------------
 
 
@@ -153,7 +162,13 @@ def me(user: dict = Depends(current_user)):
 def list_labels(user: dict = Depends(current_user)):
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM labels ORDER BY id"
+            "SELECT l.*, "
+            "uw.display_name AS withdrawn_by_name, "
+            "ur.display_name AS restored_by_name "
+            "FROM labels l "
+            "LEFT JOIN users uw ON uw.id = l.withdrawn_by "
+            "LEFT JOIN users ur ON ur.id = l.restored_by "
+            "ORDER BY l.id"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -162,12 +177,13 @@ def list_labels(user: dict = Depends(current_user)):
 def create_label(body: LabelBody, user: dict = Depends(require_roles("librarian"))):
     with db._write_lock, get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO labels (source_text, source_rev, created_at, updated_at) VALUES (?,1,?,?)",
+            "INSERT INTO labels (source_text, source_rev, created_at, updated_at, "
+            "display_status, status_version) VALUES (?,1,?,?, 'on_display', 1)",
             (body.source_text.strip(), now(), now()),
         )
         conn.commit()
         label_id = cur.lastrowid
-    return {"id": label_id, "source_rev": 1}
+    return {"id": label_id, "source_rev": 1, "display_status": "on_display", "status_version": 1}
 
 
 @app.put("/api/labels/{label_id}")
@@ -200,6 +216,134 @@ def update_label(label_id: int, body: LabelBody, user: dict = Depends(require_ro
         conn.commit()
         new_row = conn.execute("SELECT * FROM labels WHERE id = ?", (label_id,)).fetchone()
     return dict(new_row)
+
+
+# ---------------------------- 撤展 / 复展 ----------------------------
+
+
+def _label_with_operators(conn, label_id: int):
+    return conn.execute(
+        "SELECT l.*, uw.display_name AS withdrawn_by_name, "
+        "ur.display_name AS restored_by_name "
+        "FROM labels l "
+        "LEFT JOIN users uw ON uw.id = l.withdrawn_by "
+        "LEFT JOIN users ur ON ur.id = l.restored_by "
+        "WHERE l.id = ?",
+        (label_id,),
+    ).fetchone()
+
+
+@app.post("/api/labels/{label_id}/withdraw")
+def withdraw_label(label_id: int, body: WithdrawBody,
+                   user: dict = Depends(require_roles("librarian"))):
+    """馆员撤展：按展签编号 + 读取时的状态版本 + 原因撤展。
+
+    撤展立即把该展签从所有语言的“游客最新发布内容”中隐藏（快照 JSON 不可变，
+    仅在游客读取时过滤）；历史快照及已登录用户查询快照内容不变。
+    撤展展签不计入看板待办/发布条件，也不写入后续快照。
+    """
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(422, "撤展原因不能为空")
+    with db._write_lock, get_conn() as conn:
+        row = conn.execute("SELECT * FROM labels WHERE id = ?", (label_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "展签编号无效：不存在该展签")
+        if body.status_version != row["status_version"]:
+            raise HTTPException(
+                409,
+                f"状态版本已过期（服务器状态版本 {row['status_version']}，"
+                f"请求基于 {body.status_version}），请刷新后重试",
+            )
+        if row["display_status"] == "withdrawn":
+            raise HTTPException(409, "该展签已处于撤展状态，请勿重复撤展")
+
+        ts = now()
+        conn.execute(
+            "UPDATE labels SET display_status = 'withdrawn', "
+            "status_version = status_version + 1, "
+            "withdrawn_reason = ?, withdrawn_by = ?, withdrawn_at = ? WHERE id = ?",
+            (reason, user["id"], ts, label_id),
+        )
+        new_version = row["status_version"] + 1
+        conn.execute(
+            "INSERT INTO label_status_events "
+            "(label_id, action, reason, status_version, operator_id, created_at) "
+            "VALUES (?, 'withdraw', ?, ?, ?, ?)",
+            (label_id, reason, new_version, user["id"], ts),
+        )
+        # 所有语言的游客最新快照立即过滤该展签；直到某语言发布的新快照重新收录。
+        conn.execute(
+            "INSERT OR IGNORE INTO label_hidden_in_public (label_id, language_id) "
+            "SELECT ?, id FROM languages",
+            (label_id,),
+        )
+        conn.commit()
+        new_row = _label_with_operators(conn, label_id)
+    return dict(new_row)
+
+
+@app.post("/api/labels/{label_id}/restore")
+def restore_label(label_id: int, body: RestoreBody,
+                  user: dict = Depends(require_roles("librarian"))):
+    """馆员复展：按展签编号 + 状态版本复展。
+
+    保留译文但清除该展签各语言译文的确认；游客仍看不到它，直到对应语言译文
+    按当前原文经他人确认并发布新快照（发布时才解除游客隐藏标记）。
+    """
+    with db._write_lock, get_conn() as conn:
+        row = conn.execute("SELECT * FROM labels WHERE id = ?", (label_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "展签编号无效：不存在该展签")
+        if body.status_version != row["status_version"]:
+            raise HTTPException(
+                409,
+                f"状态版本已过期（服务器状态版本 {row['status_version']}，"
+                f"请求基于 {body.status_version}），请刷新后重试",
+            )
+        if row["display_status"] == "on_display":
+            raise HTTPException(409, "该展签当前在展，请勿重复复展")
+
+        ts = now()
+        conn.execute(
+            "UPDATE labels SET display_status = 'on_display', "
+            "status_version = status_version + 1, "
+            "restored_by = ?, restored_at = ? WHERE id = ?",
+            (user["id"], ts, label_id),
+        )
+        # 复展保留译文文本，但清除各语言确认（须他人重新确认后才可发布）
+        conn.execute(
+            "UPDATE translations SET confirmed = 0, confirmer_id = NULL WHERE label_id = ?",
+            (label_id,),
+        )
+        # 注意：不清除 label_hidden_in_public —— 游客仍看不到，须等新快照发布。
+        new_version = row["status_version"] + 1
+        conn.execute(
+            "INSERT INTO label_status_events "
+            "(label_id, action, reason, status_version, operator_id, created_at) "
+            "VALUES (?, 'restore', NULL, ?, ?, ?)",
+            (label_id, new_version, user["id"], ts),
+        )
+        conn.commit()
+        new_row = _label_with_operators(conn, label_id)
+    return dict(new_row)
+
+
+@app.get("/api/labels/{label_id}/status-events")
+def label_status_events(label_id: int, user: dict = Depends(current_user)):
+    """撤展 / 复展历史（状态、原因、操作者、时间）。"""
+    with get_conn() as conn:
+        label = conn.execute("SELECT 1 FROM labels WHERE id = ?", (label_id,)).fetchone()
+        if not label:
+            raise HTTPException(404, "展签编号无效：不存在该展签")
+        rows = conn.execute(
+            "SELECT e.id, e.action, e.reason, e.status_version, e.created_at, "
+            "u.display_name AS operator_name, u.username AS operator_username "
+            "FROM label_status_events e JOIN users u ON u.id = e.operator_id "
+            "WHERE e.label_id = ? ORDER BY e.id DESC",
+            (label_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------- 语言 ----------------------------
@@ -236,7 +380,9 @@ def build_board(conn, language_id: int) -> dict:
     if not lang:
         raise HTTPException(404, "语言不存在")
 
-    labels = conn.execute("SELECT * FROM labels ORDER BY id").fetchall()
+    labels = conn.execute(
+        "SELECT * FROM labels WHERE display_status = 'on_display' ORDER BY id"
+    ).fetchall()
     trans_rows = conn.execute(
         "SELECT t.*, uu.display_name AS translator_name, "
         "       ur.display_name AS confirmer_name "
@@ -272,17 +418,39 @@ def build_board(conn, language_id: int) -> dict:
             "reason": reason,
         })
 
+    # 已撤展展签：不计入统计与发布条件，单列供工作台查看（含撤展原因/操作者/时间）
+    withdrawn_rows = conn.execute(
+        "SELECT l.*, uw.display_name AS withdrawn_by_name "
+        "FROM labels l LEFT JOIN users uw ON uw.id = l.withdrawn_by "
+        "WHERE l.display_status = 'withdrawn' ORDER BY l.id"
+    ).fetchall()
+    withdrawn_items = []
+    for wl in withdrawn_rows:
+        wt = trans_map.get(wl["id"])
+        withdrawn_items.append({
+            "label": dict(wl),
+            "translation": wt,
+            "reason_text": wl["withdrawn_reason"],
+            "withdrawn_by_name": wl["withdrawn_by_name"],
+            "withdrawn_at": wl["withdrawn_at"],
+        })
+
     total = len(items)
+    all_label_count = conn.execute("SELECT COUNT(*) c FROM labels").fetchone()["c"]
+    withdrawn_count = len(withdrawn_items)
     blocking = []
-    if total == 0:
-        blocking.append("该语言下尚无任何展签")
-    if counts["missing"]:
-        blocking.append(f"{counts['missing']} 条待译")
-    if counts["stale"]:
-        blocking.append(f"{counts['stale']} 条译文基于旧版原文（过期）")
-    if counts["pending"]:
-        blocking.append(f"{counts['pending']} 条待校对确认")
-    publishable = total > 0 and counts["ready"] == total
+    if all_label_count == 0:
+        blocking.append("系统中尚无任何展签")
+    elif total == 0:
+        blocking.append(f"当前无在展展签（{withdrawn_count} 条已撤展），无法发布")
+    else:
+        if counts["missing"]:
+            blocking.append(f"{counts['missing']} 条待译")
+        if counts["stale"]:
+            blocking.append(f"{counts['stale']} 条译文基于旧版原文（过期）")
+        if counts["pending"]:
+            blocking.append(f"{counts['pending']} 条待校对确认")
+    publishable = total > 0 and counts["ready"] == total and all_label_count > 0
 
     # 最新快照
     snap = conn.execute(
@@ -297,6 +465,8 @@ def build_board(conn, language_id: int) -> dict:
         "total": total,
         "counts": counts,
         "items": items,
+        "withdrawn_items": withdrawn_items,
+        "withdrawn_count": withdrawn_count,
         "publishable": publishable,
         "blocking_reasons": blocking,
         "latest_snapshot": dict(snap) if snap else None,
@@ -321,6 +491,7 @@ def overview(user: dict = Depends(current_user)):
                 "language": b["language"],
                 "total": b["total"],
                 "counts": b["counts"],
+                "withdrawn_count": b["withdrawn_count"],
                 "publishable": b["publishable"],
                 "blocking_reasons": b["blocking_reasons"],
                 "latest_snapshot": b["latest_snapshot"],
@@ -340,6 +511,8 @@ def submit_translation_for_label(
         label = conn.execute("SELECT * FROM labels WHERE id = ?", (label_id,)).fetchone()
         if not label:
             raise HTTPException(404, "展签不存在")
+        if label["display_status"] == "withdrawn":
+            raise HTTPException(409, "该展签已撤展，撤展期间不能提交或修订译文；须先由馆员复展")
         lang = conn.execute("SELECT 1 FROM languages WHERE id = ?", (language_id,)).fetchone()
         if not lang:
             raise HTTPException(404, "语言不存在")
@@ -407,6 +580,8 @@ def confirm_translation(
         ).fetchone()
         if not t:
             raise HTTPException(404, "尚无译文，无法确认")
+        if label["display_status"] == "withdrawn":
+            raise HTTPException(409, "该展签已撤展，撤展期间不能确认译文；须先由馆员复展")
         if body.source_rev != label["source_rev"]:
             raise HTTPException(409, "原文已有新版本，该译文已过期，请退回译者更新")
         if body.trans_rev != t["trans_rev"]:
@@ -499,6 +674,16 @@ def publish_snapshot(
             "VALUES (?,?,?,?,?)",
             (language_id, version, user["id"], now(), json.dumps(payload, ensure_ascii=False)),
         )
+        # 新快照仅收录在展展签：这些展签在该语言对游客恢复可见（撤展中的不受影响）。
+        # 复展后尚未重新确认/发布的展签因未进入 entries，标记保留，游客仍看不到。
+        included_ids = [e["label_id"] for e in entries]
+        if included_ids:
+            placeholders = ",".join("?" for _ in included_ids)
+            conn.execute(
+                f"DELETE FROM label_hidden_in_public "
+                f"WHERE language_id = ? AND label_id IN ({placeholders})",
+                [language_id, *included_ids],
+            )
         conn.commit()
         sid = cur.lastrowid
     return {"id": sid, "version": version}
@@ -509,7 +694,11 @@ def publish_snapshot(
 
 @app.get("/api/public/languages")
 def public_languages():
-    """游客页：每个语言展示最新已发布快照；未发布的语言标注暂无内容。"""
+    """游客页：每个语言展示最新已发布快照；未发布的语言标注暂无内容。
+
+    撤展展签立即从游客最新发布内容中隐藏（快照 JSON 不可变，仅在此读取时过滤；
+    字段约定保持不变）。复展但尚未发布新快照的展签同样继续隐藏。
+    """
     with get_conn() as conn:
         langs = conn.execute("SELECT * FROM languages ORDER BY id").fetchall()
         result = []
@@ -524,11 +713,19 @@ def public_languages():
             }
             if snap:
                 payload = json.loads(snap["payload"])
+                hidden = {
+                    r["label_id"] for r in conn.execute(
+                        "SELECT label_id FROM label_hidden_in_public WHERE language_id = ?",
+                        (lang["id"],),
+                    ).fetchall()
+                }
+                visible_entries = [e for e in payload["entries"]
+                                   if e["label_id"] not in hidden]
                 entry.update({
                     "snapshot_id": snap["id"],
                     "version": snap["version"],
                     "published_at": snap["published_at"],
-                    "entries": payload["entries"],
+                    "entries": visible_entries,
                 })
             result.append(entry)
     return result

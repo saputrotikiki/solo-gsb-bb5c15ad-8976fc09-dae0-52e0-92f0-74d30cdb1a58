@@ -99,16 +99,62 @@ async function loadLanguages() {
 
 async function loadLabelAdmin() {
   const labels = await api('/api/labels');
-  $('#label-admin').innerHTML = labels.map((l) => `
+  const onShow = labels.filter((l) => l.display_status !== 'withdrawn');
+  const withdrawn = labels.filter((l) => l.display_status === 'withdrawn');
+
+  const renderOnShow = (l) => `
     <div class="item" data-label="${l.id}">
-      <div class="meta">#${l.id} · 原文修订号 ${l.source_rev} · 更新于 ${esc(l.updated_at)}</div>
+      <div class="meta">#${l.id} · 原文修订号 ${l.source_rev} · 更新于 ${esc(l.updated_at)}
+        <span class="tag ready">在展</span>
+      </div>
       <textarea class="src-edit" rows="2">${esc(l.source_text)}</textarea>
       <div class="row-actions">
         <button class="small ghost save-src" data-id="${l.id}" data-rev="${l.source_rev}">
           保存原文（修订号升至 ${l.source_rev + 1}，并使该条所有译文确认失效）
         </button>
+        <button class="small danger toggle-withdraw" data-id="${l.id}" data-sv="${l.status_version}">
+          撤展
+        </button>
       </div>
-    </div>`).join('') || '<div class="muted">暂无展签。</div>';
+      <div class="withdraw-form" hidden data-label="${l.id}">
+        <label>撤展原因（必填，工作台与审计记录保留）</label>
+        <textarea class="withdraw-reason" rows="2" placeholder="例如：文物外借、展签内容待核…"></textarea>
+        <div class="row-actions">
+          <button class="small danger do-withdraw" data-id="${l.id}" data-sv="${l.status_version}">
+            确认撤展
+          </button>
+          <button class="small ghost cancel-withdraw">取消</button>
+        </div>
+      </div>
+    </div>`;
+
+  const renderWithdrawn = (l) => `
+    <div class="item withdrawn-item" data-label="${l.id}">
+      <div class="meta">#${l.id} · 原文修订号 ${l.source_rev}
+        <span class="tag withdrawn">已撤展</span>
+      </div>
+      <div class="src">${esc(l.source_text)}</div>
+      <div class="reason-block">
+        撤展原因：${esc(l.withdrawn_reason || '—')}<br>
+        撤展：${esc(l.withdrawn_by_name || ('#' + l.withdrawn_by))} · ${esc(l.withdrawn_at)}
+        ${l.restored_at ? `（曾复展于 ${esc(l.restored_at)}）` : ''}
+      </div>
+      <div class="muted" style="margin:6px 0">
+        撤展后已从所有语言游客最新内容隐藏；译文保留，复展后须经他人重新确认并发新快照。
+      </div>
+      <div class="row-actions">
+        <button class="small do-restore" data-id="${l.id}" data-sv="${l.status_version}">
+          复展（状态版本升至 ${l.status_version + 1}，清除各语言确认）
+        </button>
+        <button class="small ghost view-events" data-id="${l.id}">撤展/复展记录</button>
+      </div>
+    </div>`;
+
+  $('#label-admin').innerHTML = `
+    <div class="section-title" style="margin-top:0"><h2 style="font-size:14px">在展展签</h2></div>
+    ${onShow.map(renderOnShow).join('') || '<div class="muted">暂无在展展签。</div>'}
+    <div class="section-title"><h2 style="font-size:14px">已撤展展签（${withdrawn.length}）</h2></div>
+    ${withdrawn.map(renderWithdrawn).join('') || '<div class="muted">无。</div>'}`;
 
   document.querySelectorAll('.save-src').forEach((btn) =>
     btn.addEventListener('click', async () => {
@@ -128,6 +174,84 @@ async function loadLabelAdmin() {
         btn.disabled = false;
       }
     }));
+
+  // 展开撤展原因表单
+  document.querySelectorAll('.toggle-withdraw').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      btn.closest('.item').querySelector('.withdraw-form').hidden = false;
+      btn.disabled = true;
+    }));
+  document.querySelectorAll('.cancel-withdraw').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const form = btn.closest('.withdraw-form');
+      form.hidden = true;
+      form.querySelector('.withdraw-reason').value = '';
+      const item = btn.closest('.item');
+      const t = item.querySelector('.toggle-withdraw');
+      if (t) t.disabled = false;
+    }));
+
+  // 确认撤展
+  document.querySelectorAll('.do-withdraw').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.id;
+      const reason = btn.closest('.withdraw-form').querySelector('.withdraw-reason').value.trim();
+      if (!reason) return toast('撤展原因必填', true);
+      btn.disabled = true;
+      try {
+        await api(`/api/labels/${id}/withdraw`, {
+          method: 'POST',
+          body: JSON.stringify({ status_version: Number(btn.dataset.sv), reason }),
+        });
+        toast('已撤展：游客最新内容立即隐藏，看板待办与发布不再计入该展签');
+        await Promise.all([loadLabelAdmin(), loadBoard()]);
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    }));
+
+  // 复展
+  document.querySelectorAll('.do-restore').forEach((btn) =>
+    btn.addEventListener('click', () => restoreLabel(btn.dataset.id, Number(btn.dataset.sv), btn)));
+
+  // 撤展/复展记录
+  document.querySelectorAll('.view-events').forEach((btn) =>
+    btn.addEventListener('click', () => viewStatusEvents(btn.dataset.id)));
+}
+
+async function restoreLabel(id, statusVersion, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/api/labels/${id}/restore`, {
+      method: 'POST',
+      body: JSON.stringify({ status_version: statusVersion }),
+    });
+    toast('已复展：译文保留但各语言确认已清除，须经他人重新确认并发布新快照后游客才可见');
+    await Promise.all([loadLabelAdmin(), loadBoard()]);
+  } catch (e) {
+    toast(e.message, true);
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function viewStatusEvents(id) {
+  const events = await api(`/api/labels/${id}/status-events`);
+  $('#snap-title').textContent = `展签 #${id} 撤展 / 复展记录`;
+  $('#snap-body').innerHTML = events.length
+    ? events.map((e) => `
+      <div class="visitor-entry">
+        <div class="meta">${esc(e.created_at)} · 状态版本 ${e.status_version}</div>
+        <div>
+          <span class="tag ${e.action === 'withdraw' ? 'withdrawn' : 'ready'}">
+            ${e.action === 'withdraw' ? '撤展' : '复展'}
+          </span>
+          <b style="margin-left:8px">${esc(e.operator_name)}（${esc(e.operator_username)}）</b>
+        </div>
+        ${e.reason ? `<div class="t" style="margin-top:4px">原因：${esc(e.reason)}</div>` : ''}
+      </div>`).join('')
+    : '<div class="muted">暂无记录。</div>';
+  $('#snapshot-modal').hidden = false;
 }
 
 function bindLibrarianEvents() {
@@ -202,18 +326,58 @@ function renderBoard() {
       <div class="stat s-pending"><b>${c.pending}</b>待审</div>
       <div class="stat s-stale"><b>${c.stale}</b>过期</div>
       <div class="stat s-ready"><b>${c.ready}</b>已确认</div>
-      <div class="stat"><b>${b.total}</b>总计</div>
+      <div class="stat"><b>${b.total}</b>在展</div>
+      <div class="stat s-withdrawn"><b>${b.withdrawn_count}</b>已撤展</div>
     </div>
     <div class="snap-meta" style="margin-top:8px">${statusLine}</div>
     ${publishHtml}
   </div>`;
 
   html += '<div class="card">' + b.items.map(renderItem).join('') + '</div>';
+
+  // 已撤展展签（不计入待办与发布条件；只读，馆员可在此复展）
+  html += `
+  <div class="card">
+    <h2>已撤展展签（${b.withdrawn_count}）
+      <span class="muted" style="font-weight:400">不计入待办/发布，游客最新内容不可见</span>
+    </h2>
+    ${(b.withdrawn_items || []).map(renderWithdrawnBoardItem).join('')
+      || '<div class="muted">该语言暂无已撤展展签。</div>'}
+  </div>`;
+
   $('#board').innerHTML = html;
 
   const pb = $('#publish-btn');
   if (pb) pb.addEventListener('click', publishSnapshot);
+  document.querySelectorAll('.board-restore').forEach((btn) =>
+    btn.addEventListener('click', () => restoreLabel(btn.dataset.id, Number(btn.dataset.sv), btn)));
   bindItemEvents();
+}
+
+function renderWithdrawnBoardItem(w) {
+  const l = w.label;
+  const t = w.translation;
+  return `
+  <div class="item withdrawn-item" data-label="${l.id}">
+    <div class="meta">
+      展签 #${l.id} · 原文修订号 ${l.source_rev}
+      <span class="tag withdrawn">已撤展</span>
+    </div>
+    <div class="src">${esc(l.source_text)}</div>
+    <div class="reason-block">
+      撤展原因：${esc(w.reason_text || '—')}<br>
+      撤展：${esc(w.withdrawn_by_name || ('#' + l.withdrawn_by))} · ${esc(w.withdrawn_at)}
+    </div>
+    ${t ? `<div class="muted" style="margin-top:4px">
+      译文保留（修订号 ${t.trans_rev}）；复展后确认已清除，须他人重新确认。</div>`
+      : '<div class="muted" style="margin-top:4px">该语言尚无译文。</div>'}
+    ${isLibrarian() ? `
+    <div class="row-actions">
+      <button class="small board-restore" data-id="${l.id}" data-sv="${l.status_version}">
+        复展
+      </button>
+    </div>` : ''}
+  </div>`;
 }
 
 function renderItem(item) {

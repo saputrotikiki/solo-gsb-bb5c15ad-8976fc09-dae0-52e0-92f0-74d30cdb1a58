@@ -54,7 +54,36 @@ CREATE TABLE IF NOT EXISTS labels (
     source_text TEXT NOT NULL,
     source_rev INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- 在展状态：on_display 在展 / withdrawn 已撤展；status_version 为状态版本（乐观锁）
+    display_status TEXT NOT NULL DEFAULT 'on_display'
+        CHECK (display_status IN ('on_display','withdrawn')),
+    status_version INTEGER NOT NULL DEFAULT 1,
+    withdrawn_reason TEXT,
+    withdrawn_by INTEGER REFERENCES users(id),
+    withdrawn_at TEXT,
+    restored_by INTEGER REFERENCES users(id),
+    restored_at TEXT
+);
+
+-- 撤展 / 复展审计流水（工作台展示状态、原因、操作者、时间）
+CREATE TABLE IF NOT EXISTS label_status_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    action TEXT NOT NULL CHECK (action IN ('withdraw','restore')),
+    reason TEXT,
+    status_version INTEGER NOT NULL,        -- 本次变更后的状态版本
+    operator_id INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+);
+
+-- 游客可见性标记：存在 (label_id, language_id) 表示该展签须从该语言
+-- “游客最新快照”中过滤掉；复展后不清除，直到该语言发布的新快照重新收录该展签。
+-- 快照 payload 本身永不修改（历史快照 / 登录用户查快照内容保持不变）。
+CREATE TABLE IF NOT EXISTS label_hidden_in_public (
+    label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    language_id INTEGER NOT NULL REFERENCES languages(id) ON DELETE CASCADE,
+    PRIMARY KEY (label_id, language_id)
 );
 
 CREATE TABLE IF NOT EXISTS translations (
@@ -88,10 +117,29 @@ def hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
 
 
+# 旧库（本轮功能上线前创建）增量加列，保证既有部署升级后可直接启动。
+def _migrate(conn: sqlite3.Connection) -> None:
+    label_cols = {r["name"] for r in conn.execute("PRAGMA table_info(labels)").fetchall()}
+    label_adds = [
+        ("display_status", "ALTER TABLE labels ADD COLUMN display_status TEXT NOT NULL DEFAULT 'on_display'"),
+        ("status_version", "ALTER TABLE labels ADD COLUMN status_version INTEGER NOT NULL DEFAULT 1"),
+        ("withdrawn_reason", "ALTER TABLE labels ADD COLUMN withdrawn_reason TEXT"),
+        ("withdrawn_by", "ALTER TABLE labels ADD COLUMN withdrawn_by INTEGER REFERENCES users(id)"),
+        ("withdrawn_at", "ALTER TABLE labels ADD COLUMN withdrawn_at TEXT"),
+        ("restored_by", "ALTER TABLE labels ADD COLUMN restored_by INTEGER REFERENCES users(id)"),
+        ("restored_at", "ALTER TABLE labels ADD COLUMN restored_at TEXT"),
+    ]
+    for col, ddl in label_adds:
+        if col not in label_cols:
+            conn.execute(ddl)
+    conn.commit()
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
         # 默认账号（可通过环境变量覆盖，README 说明）
         seed_users = [

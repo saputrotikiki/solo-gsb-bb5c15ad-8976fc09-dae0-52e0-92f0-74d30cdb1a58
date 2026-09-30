@@ -36,7 +36,9 @@ async function load() {
       <div class="snap-meta">
         最新版本 v${lang.version} · 发布于 ${esc(lang.published_at)}
       </div>
-      ${lang.entries.map((e) => `
+      ${lang.entries.length === 0
+        ? '<div class="visitor-empty">该语言当前无在展展签（展签已撤展或正在调整）。</div>'
+        : lang.entries.map((e) => `
         <div class="visitor-entry">
           <div class="zh">${esc(e.source_text)}</div>
           <div class="t">${esc(e.text)}</div>
