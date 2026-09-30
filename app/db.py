@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS labels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_text TEXT NOT NULL,
     source_rev INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'on_display',  -- on_display 在展 / withdrawn 已撤展
+    status_rev INTEGER NOT NULL DEFAULT 1,       -- 状态版本：撤展/复展各 +1（乐观锁）
+    withdrawn_reason TEXT,
+    withdrawn_by INTEGER REFERENCES users(id),
+    withdrawn_at TEXT,
+    restored_by INTEGER REFERENCES users(id),
+    restored_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -65,6 +72,7 @@ CREATE TABLE IF NOT EXISTS translations (
     trans_rev INTEGER NOT NULL DEFAULT 1,
     source_rev_at_edit INTEGER NOT NULL,  -- 译文最后一次提交时对应的原文修订号
     confirmed INTEGER NOT NULL DEFAULT 0,
+    public_hidden INTEGER NOT NULL DEFAULT 0,  -- 游客最新内容是否隐藏（撤展置1，随含该条的新快照发布清0）
     translator_id INTEGER REFERENCES users(id),
     confirmer_id INTEGER REFERENCES users(id),
     updated_at TEXT NOT NULL,
@@ -88,10 +96,33 @@ def hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为老版本数据库补齐本轮新增列（幂等）。"""
+    label_cols = {r["name"] for r in conn.execute("PRAGMA table_info(labels)").fetchall()}
+    for ddl in (
+        "ALTER TABLE labels ADD COLUMN status TEXT NOT NULL DEFAULT 'on_display'",
+        "ALTER TABLE labels ADD COLUMN status_rev INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE labels ADD COLUMN withdrawn_reason TEXT",
+        "ALTER TABLE labels ADD COLUMN withdrawn_by INTEGER REFERENCES users(id)",
+        "ALTER TABLE labels ADD COLUMN withdrawn_at TEXT",
+        "ALTER TABLE labels ADD COLUMN restored_by INTEGER REFERENCES users(id)",
+        "ALTER TABLE labels ADD COLUMN restored_at TEXT",
+    ):
+        col = ddl.split("ADD COLUMN")[1].strip().split()[0]
+        if col not in label_cols:
+            conn.execute(ddl)
+    trans_cols = {r["name"] for r in conn.execute("PRAGMA table_info(translations)").fetchall()}
+    if "public_hidden" not in trans_cols:
+        conn.execute(
+            "ALTER TABLE translations ADD COLUMN public_hidden INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
         # 默认账号（可通过环境变量覆盖，README 说明）
         seed_users = [

@@ -99,16 +99,46 @@ async function loadLanguages() {
 
 async function loadLabelAdmin() {
   const labels = await api('/api/labels');
-  $('#label-admin').innerHTML = labels.map((l) => `
+  $('#label-admin').innerHTML = labels.map((l) => {
+    const withdrawn = l.status === 'withdrawn';
+    const statusBadge = withdrawn
+      ? '<span class="tag withdrawn">已撤展</span>'
+      : '<span class="tag ready">在展</span>';
+    let statusHtml = '';
+    if (withdrawn) {
+      statusHtml = `
+        <div class="withdraw-box">
+          撤展原因：<b>${esc(l.withdrawn_reason || '（未填写）')}</b>
+          <span class="muted">· ${esc(l.withdrawn_at)} · 操作人 ${esc(l.withdrawn_by_name || ('#' + l.withdrawn_by))}</span>
+        </div>`;
+    } else if (l.restored_at) {
+      statusHtml = `
+        <div class="muted">
+          曾撤展，已于 ${esc(l.restored_at)} 由 ${esc(l.restored_by_name || ('#' + l.restored_by))} 复展；
+          各语言译文确认已清除，须重新经他人确认并发布新快照后游客才可见。
+        </div>`;
+    }
+    const statusActions = withdrawn
+      ? `<button class="small restore-label" data-id="${l.id}" data-rev="${l.status_rev}">复展（状态版本升至 ${l.status_rev + 1}，清除各语言确认、保留译文）</button>`
+      : `
+        <input type="text" class="withdraw-reason" placeholder="撤展原因（必填）">
+        <button class="small danger withdraw-label" data-id="${l.id}" data-rev="${l.status_rev}">撤展（立即从所有语言游客最新内容隐藏）</button>`;
+    return `
     <div class="item" data-label="${l.id}">
-      <div class="meta">#${l.id} · 原文修订号 ${l.source_rev} · 更新于 ${esc(l.updated_at)}</div>
+      <div class="meta">
+        #${l.id} · 原文修订号 ${l.source_rev} · 状态版本 ${l.status_rev} · 更新于 ${esc(l.updated_at)}
+        ${statusBadge}
+      </div>
       <textarea class="src-edit" rows="2">${esc(l.source_text)}</textarea>
+      ${statusHtml}
       <div class="row-actions">
         <button class="small ghost save-src" data-id="${l.id}" data-rev="${l.source_rev}">
           保存原文（修订号升至 ${l.source_rev + 1}，并使该条所有译文确认失效）
         </button>
+        ${statusActions}
       </div>
-    </div>`).join('') || '<div class="muted">暂无展签。</div>';
+    </div>`;
+  }).join('') || '<div class="muted">暂无展签。</div>';
 
   document.querySelectorAll('.save-src').forEach((btn) =>
     btn.addEventListener('click', async () => {
@@ -122,6 +152,41 @@ async function loadLabelAdmin() {
           body: JSON.stringify({ source_text: text, source_rev: Number(btn.dataset.rev) }),
         });
         toast('原文已更新：修订号 +1，相关译文确认已失效');
+        await Promise.all([loadLabelAdmin(), loadBoard()]);
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    }));
+
+  document.querySelectorAll('.withdraw-label').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.id;
+      const reason = document.querySelector(`.item[data-label="${id}"] .withdraw-reason`).value.trim();
+      if (!reason) return toast('撤展原因必填', true);
+      btn.disabled = true;
+      try {
+        await api('/api/labels/' + id + '/withdraw', {
+          method: 'POST',
+          body: JSON.stringify({ status_rev: Number(btn.dataset.rev), reason }),
+        });
+        toast('已撤展：游客最新内容立即对所有语言隐藏，历史快照不变');
+        await Promise.all([loadLabelAdmin(), loadBoard()]);
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    }));
+
+  document.querySelectorAll('.restore-label').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await api('/api/labels/' + btn.dataset.id + '/restore', {
+          method: 'POST',
+          body: JSON.stringify({ status_rev: Number(btn.dataset.rev) }),
+        });
+        toast('已复展：译文保留、确认已清除；重新确认并发布新快照后游客才可见');
         await Promise.all([loadLabelAdmin(), loadBoard()]);
       } catch (e) {
         toast(e.message, true);
@@ -202,13 +267,21 @@ function renderBoard() {
       <div class="stat s-pending"><b>${c.pending}</b>待审</div>
       <div class="stat s-stale"><b>${c.stale}</b>过期</div>
       <div class="stat s-ready"><b>${c.ready}</b>已确认</div>
-      <div class="stat"><b>${b.total}</b>总计</div>
+      <div class="stat"><b>${b.total}</b>在展总计</div>
+      <div class="stat s-withdrawn"><b>${b.withdrawn_total || 0}</b>已撤展</div>
     </div>
     <div class="snap-meta" style="margin-top:8px">${statusLine}</div>
     ${publishHtml}
   </div>`;
 
   html += '<div class="card">' + b.items.map(renderItem).join('') + '</div>';
+  if (b.withdrawn_items && b.withdrawn_items.length) {
+    html += `
+    <div class="card withdrawn-card">
+      <h2>已撤展展签（不计入待办与发布，游客最新内容不可见）</h2>
+      ${b.withdrawn_items.map(renderWithdrawnItem).join('')}
+    </div>`;
+  }
   $('#board').innerHTML = html;
 
   const pb = $('#publish-btn');
@@ -281,6 +354,34 @@ function renderItem(item) {
     ${transHtml}
     <div class="reason ${item.status === 'ready' ? 'ok' : ''}">${esc(item.reason)}</div>
     ${actions}
+  </div>`;
+}
+
+function renderWithdrawnItem(item) {
+  const l = item.label;
+  const t = item.translation;
+  const transHtml = t ? `
+    <div class="trans">
+      <div class="meta">
+        译文修订号 ${t.trans_rev} · 对应原文修订号 ${t.source_rev_at_edit} ·
+        译者 ${esc(t.translator_name || ('#' + t.translator_id))}
+        ${t.confirmed ? ` · 原确认人 ${esc(t.confirmer_name || ('#' + t.confirmer_id))}（复展后确认已失效）` : ''}
+      </div>
+      <div class="text muted">${esc(t.text)}</div>
+    </div>` : '<div class="muted">尚无译文。</div>';
+  return `
+  <div class="item withdrawn-item" data-label="${l.id}">
+    <div class="meta">
+      展签 #${l.id} · 原文修订号 ${l.source_rev} · 状态版本 ${l.status_rev}
+      <span class="tag withdrawn">已撤展</span>
+    </div>
+    <div class="src">${esc(l.source_text)}</div>
+    ${transHtml}
+    <div class="withdraw-box">
+      撤展原因：<b>${esc(l.withdrawn_reason || '（未填写）')}</b>
+      <span class="muted">· ${esc(l.withdrawn_at)} · 操作人 ${esc(l.withdrawn_by_name || ('#' + l.withdrawn_by))}</span>
+    </div>
+    <div class="muted">已从该语言游客最新发布内容中隐藏；历史快照内容保持不变。</div>
   </div>`;
 }
 

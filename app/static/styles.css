@@ -93,6 +93,7 @@ a { color: var(--brand); }
 .stat.s-pending { background: var(--amber-bg); color: var(--amber); }
 .stat.s-stale { background: var(--red-bg); color: var(--red); }
 .stat.s-ready { background: var(--green-bg); color: var(--green); }
+.stat.s-withdrawn { background: #e5e7eb; color: #374151; }
 
 .publish-box { margin-top: 12px; font-size: 14px; }
 .publish-box.ok { color: var(--green); }
@@ -111,6 +112,19 @@ a { color: var(--brand); }
 .tag.pending { background: var(--amber-bg); color: var(--amber); }
 .tag.stale { background: var(--red-bg); color: var(--red); }
 .tag.ready { background: var(--green-bg); color: var(--green); }
+.tag.withdrawn { background: #e5e7eb; color: #374151; }
+
+button.danger { background: var(--red); }
+button.danger:hover { background: #991b1b; }
+.withdraw-box {
+  margin-top: 8px;
+  font-size: 13px;
+  background: var(--red-bg);
+  color: var(--red);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+.withdrawn-card { background: #fafafa; }
 
 /* 展签条目 */
 .item { border-top: 1px solid var(--line); padding: 14px 0; }
